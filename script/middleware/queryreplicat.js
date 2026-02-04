@@ -205,13 +205,51 @@ function extractPriceConditions(text) {
  * @returns {number|null} Limit
  */
 function extractLimit(text) {
-  const match = text.match(/\btop\s+(\d+)\b|\b(\d+)\s+stocks?\b/);
+  const normalized = text.toLowerCase();
+  const wordNumberMap = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+    thirteen: 13,
+    fourteen: 14,
+    fifteen: 15,
+    sixteen: 16,
+    seventeen: 17,
+    eighteen: 18,
+    nineteen: 19,
+    twenty: 20,
+    thirty: 30,
+    forty: 40,
+    fifty: 50,
+    sixty: 60,
+    seventy: 70,
+    eighty: 80,
+    ninety: 90,
+    hundred: 100,
+  };
+
+  const match = normalized.match(
+    /\btop\s+(\d+|[a-z]+)\b|\b(\d+|[a-z]+)\s+stocks?\b/,
+  );
   if (!match) {
     return null;
   }
 
-  const value = parseInt(match[1] || match[2], 10);
-  return Number.isNaN(value) ? null : value;
+  const rawValue = match[1] || match[2];
+  const value = /\d+/.test(rawValue)
+    ? parseInt(rawValue, 10)
+    : wordNumberMap[rawValue];
+
+  return Number.isNaN(value) || !value ? null : value;
 }
 
 /**
@@ -374,6 +412,13 @@ function generateDisplayMessage(result) {
       nifty50: "NIFTY 50",
     };
     message += `\n📈 Data source: ${sourceNames[metadata.dataSource] || metadata.dataSource}`;
+  }
+
+  if (metadata.intent === "sentiment") {
+    const gainers = stockData.filter((s) => (s.pChange || 0) > 0).length;
+    const losers = stockData.filter((s) => (s.pChange || 0) < 0).length;
+    const unchanged = count - gainers - losers;
+    message += `\n🧭 Market sentiment: ${gainers} gainers, ${losers} losers, ${unchanged} unchanged`;
   }
 
   // Add processing time

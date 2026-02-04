@@ -63,6 +63,19 @@ export const VALID_FIELDS = [
   "current_price",
   "analyst_count",
   "consensus_rating",
+  // Market data fields
+  "last_price",
+  "percent_change",
+  "price_change",
+  "volume",
+  "traded_value",
+  "year_high",
+  "year_low",
+  "near_week_high",
+  "near_week_low",
+  "change_30d",
+  "change_365d",
+  "market_cap",
 ];
 
 // Field aliases (common variations)
@@ -85,6 +98,20 @@ const FIELD_ALIASES = {
   net_profit: "net_margin",
   promoter_holding: "promoter_holding_percentage",
   institutional_holding: "institutional_holding_percentage",
+  lastprice: "last_price",
+  ltp: "last_price",
+  price: "last_price",
+  pchange: "percent_change",
+  percentchange: "percent_change",
+  change: "price_change",
+  volume: "volume",
+  tradedvalue: "traded_value",
+  yearhigh: "year_high",
+  yearlow: "year_low",
+  nearwkh: "near_week_high",
+  nearwkl: "near_week_low",
+  perchange30d: "change_30d",
+  perchange365d: "change_365d",
 };
 
 // Valid operators
@@ -197,7 +224,10 @@ export function validateQueryFields(structuredQuery) {
       fields: validatedFields,
       conditions: validatedConditions,
       orderBy: validatedOrderBy,
+      orderDirection: structuredQuery.orderDirection || "desc",
       limit: structuredQuery.limit || 50,
+      dataSource: structuredQuery.dataSource || null,
+      search_term: structuredQuery.search_term || null,
       confidence: structuredQuery.confidence || 0.8,
     },
     fieldsUsed: validatedFields.length + validatedConditions.length,

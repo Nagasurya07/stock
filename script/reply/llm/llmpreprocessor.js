@@ -3,9 +3,7 @@
  * Uses Gemini AI to convert natural language queries to structured database queries
  */
 
-const GEMINI_API_KEY =
-  process.env.EXPO_PUBLIC_GEMINI_API_KEY ||
-  "AIzaSyC5ppCM0i7f2LWIN_4Ne2RnDNuE5k8lkKg";
+const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.EXPO_PUBLIC_GEMINI_MODEL || "gemini-2.5-flash";
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -15,7 +13,56 @@ const GROQ_MODEL = process.env.EXPO_PUBLIC_GROQ_MODEL || "mixtral-8x7b-32768";
 const GROQ_API_BASE = "https://api.groq.com/openai/v1";
 // AI Configuration: Use AI in 90% of scenarios, fallback in 10%
 const USE_AI_PERCENTAGE = 0.9;
-const AI_CONFIDENCE_THRESHOLD = 0.75;/**
+const AI_CONFIDENCE_THRESHOLD = 0.75;
+
+// Query cache to avoid duplicate AI calls
+const queryCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const MAX_CACHE_SIZE = 100;
+
+// Request deduplication
+const pendingRequests = new Map(); /**
+ * Clean expired cache entries
+ */
+function cleanCache() {
+  const now = Date.now();
+  for (const [key, value] of queryCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      queryCache.delete(key);
+    }
+  }
+  // Limit cache size
+  if (queryCache.size > MAX_CACHE_SIZE) {
+    const oldestKey = queryCache.keys().next().value;
+    queryCache.delete(oldestKey);
+  }
+}
+
+/**
+ * Get cached query or return null
+ */
+function getCachedQuery(query) {
+  const normalized = query.toLowerCase().trim();
+  const cached = queryCache.get(normalized);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    return cached.result;
+  }
+  return null;
+}
+
+/**
+ * Cache query result
+ */
+function cacheQuery(query, result) {
+  const normalized = query.toLowerCase().trim();
+  queryCache.set(normalized, {
+    result,
+    timestamp: Date.now(),
+  });
+  cleanCache();
+}
+
+/**
  * Preprocess query using Groq API (fallback when Gemini rate-limited)
  * @param {string} userQuery - User's natural language query
  * @returns {Promise<Object>} Structured query or error
@@ -91,8 +138,13 @@ async function preprocessQueryWithGroq(userQuery) {
     );
 
     return {
-      success: true,
+      error: null,
       structuredQuery: structuredQuery,
+      intent: structuredQuery.intent,
+      confidence: structuredQuery.confidence || 0.8,
+      rawResponse: content,
+      usedAI: true,
+      mode: "groq",
       source: "groq",
     };
   } catch (error) {
@@ -171,17 +223,29 @@ const SYSTEM_PROMPT = `You are a stock market query preprocessor. Convert natura
 **Available Database Fields:**
 ${VALID_FIELDS.join(", ")}
 
+**IMPORTANT RULES:**
+- For company name or symbol searches (e.g., "Infosys", "TCS", "INFY"), use "search_term" field with intent "search"
+- For filtering by metrics (e.g., "PE ratio < 15"), use the actual metric field names
+- Only use fields from the list above
+- Do NOT create fields like "company", "name", "symbol" - use "search_term" instead
+
 **Your Task:**
 1. Extract the user's intent (filter, search, analyze, compare)
-2. Identify relevant database fields
-3. Extract comparison operators (>, <, >=, <=, =, BETWEEN)
-4. Extract values or ranges
-5. Return structured JSON
+2. If query is a company name/symbol → use "search_term" field
+3. If query has metrics/conditions → use relevant database fields
+4. Extract comparison operators (>, <, >=, <=, =, BETWEEN)
+5. Extract values or ranges
+6. **CRITICAL: Extract limit from queries like "top 10", "top ten", "5 stocks", "twenty stocks"**
+   - "top ten" → limit: 10
+   - "top 5" → limit: 5
+   - "twenty stocks" → limit: 20
+7. Return structured JSON
 
 **Output Format:**
 {
   "intent": "filter|search|analyze|compare",
   "fields": ["field_name"],
+  "search_term": "company name or symbol (only for search intent)",
   "conditions": [
     {
       "field": "field_name",
@@ -196,6 +260,24 @@ ${VALID_FIELDS.join(", ")}
 }
 
 **Examples:**
+
+User: "top ten stocks"
+Response: {
+  "intent": "filter",
+  "fields": [],
+  "conditions": [],
+  "limit": 10,
+  "confidence": 0.95
+}
+
+User: "Infosys"
+Response: {
+  "intent": "search",
+  "search_term": "Infosys",
+  "fields": [],
+  "conditions": [],
+  "confidence": 0.95
+}
 
 User: "Show me stocks with PE ratio less than 15"
 Response: {
@@ -242,82 +324,67 @@ Return ONLY valid JSON. No markdown, no explanation.`;
  * @returns {Promise<Object>} Preprocessed structured query
  */
 export async function preprocessQuery(userQuery, options = {}) {
-  // Force AI usage based on configuration (90% of time)
-  const shouldUseAI = Math.random() < USE_AI_PERCENTAGE;
-  
-  if (!shouldUseAI) {
-    console.log(\"📊 Using fallback mode (10% scenario)\");
-    return createFallbackQuery(userQuery);
+  // Check cache first
+  const cached = getCachedQuery(userQuery);
+  if (cached && !options.skipCache) {
+    console.log("⚡ Using cached result");
+    return cached;
   }
 
-  if (!GEMINI_API_KEY) {
-    console.warn(\"⚠️ Gemini API key missing. Using Groq fallback...\");
-    return preprocessQueryWithGroq(userQuery);
+  // Request deduplication - if same query is already being processed, wait for it
+  const normalized = userQuery.toLowerCase().trim();
+  if (pendingRequests.has(normalized)) {
+    console.log("⏳ Waiting for pending request...");
+    return pendingRequests.get(normalized);
   }
 
-  console.log(\"🤖 Preprocessing query with AI (90% scenario)...\");
-  console.log("Input:", userQuery);
+  // Create promise for this request
+  const requestPromise = (async () => {
+    try {
+      // Force AI usage based on configuration (90% of time)
+      const shouldUseAI = Math.random() < USE_AI_PERCENTAGE;
 
+      if (!shouldUseAI) {
+        const result = createFallbackQuery(userQuery);
+        cacheQuery(userQuery, result);
+        return result;
+      }
+
+      if (!GEMINI_API_KEY) {
+        console.warn("⚠️ Gemini API key missing. Using Groq fallback...");
+        const result = await preprocessQueryWithGroq(userQuery);
+        cacheQuery(userQuery, result);
+        return result;
+      }
+
+      console.log("🤖 Preprocessing query with AI (90% scenario)...");
+      console.log("Input:", userQuery);
+
+      return await processWithGemini(userQuery);
+    } finally {
+      pendingRequests.delete(normalized);
+    }
+  })();
+
+  pendingRequests.set(normalized, requestPromise);
+  return requestPromise;
+}
+
+/**
+ * Process query with Gemini (extracted for better organization)
+ */
+async function processWithGemini(userQuery) {
   try {
-    const response = await fetch(
-      `${API_BASE}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `${SYSTEM_PROMPT}\n\nUser Query: "${userQuery}"\n\nReturn structured JSON:`,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.1,
-            topP: 0.8,
-            maxOutputTokens: 1024,
-          },
-        }),
-      },
-    );
+    const content = await callGemini(userQuery, 1024);
+    let structuredQuery;
 
-    // Check if rate-limited (429) or quota exceeded
-    if (response.status === 429) {
-      console.warn("⚠️ Gemini rate-limited! Trying Groq as fallback...");
-      return preprocessQueryWithGroq(userQuery);
+    try {
+      structuredQuery = safeParseJson(content);
+    } catch (parseError) {
+      console.warn("⚠️ Gemini returned malformed JSON. Retrying...");
+      const retryContent = await callGemini(userQuery, 512);
+      structuredQuery = safeParseJson(retryContent);
     }
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      console.error("Gemini API Error:", errorData);
-      return {
-        error: `Gemini API error: ${response.status}`,
-        structuredQuery: null,
-      };
-    }
-    const data = await response.json();
-
-    if (!data.candidates || !data.candidates[0]) {
-      return {
-        error: "No response from Gemini",
-        structuredQuery: null,
-      };
-    }
-
-    const content = data.candidates[0].content.parts[0].text;
-    console.log("Raw Gemini Response:", content);
-
-    // Extract JSON from response (handle markdown code blocks)
-    let jsonText = content.trim();
-    if (jsonText.startsWith("```json")) {
-      jsonText = jsonText.replace(/```json\n?/g, "").replace(/```\n?/g, "");
-    } else if (jsonText.startsWith("```")) {
-      jsonText = jsonText.replace(/```\n?/g, "");
-    }
-
-    const structuredQuery = JSON.parse(jsonText);
 
     console.log(
       "✅ Structured Query:",
@@ -327,7 +394,9 @@ export async function preprocessQuery(userQuery, options = {}) {
     // Validate confidence level
     const confidence = structuredQuery.confidence || 0.8;
     if (confidence < AI_CONFIDENCE_THRESHOLD) {
-      console.warn(`⚠️ Low AI confidence (${confidence}), enhancing with fallback logic...`);
+      console.warn(
+        `⚠️ Low AI confidence (${confidence}), enhancing with fallback logic...`,
+      );
       return enhanceWithFallback(structuredQuery, userQuery);
     }
 
@@ -338,13 +407,87 @@ export async function preprocessQuery(userQuery, options = {}) {
       confidence: confidence,
       rawResponse: content,
       usedAI: true,
-      mode: \"gemini\",
+      mode: "gemini",
     };
   } catch (error) {
-    console.error(\"❌ Preprocessing Error:\", error.message);
-    console.warn(\"⚠️ Gemini failed! Attempting Groq fallback...\");
+    console.error("❌ Preprocessing Error:", error.message);
+    console.warn("⚠️ Gemini failed! Attempting Groq fallback...");
     return preprocessQueryWithGroq(userQuery);
   }
+}
+
+async function callGemini(userQuery, maxOutputTokens) {
+  const response = await fetch(
+    `${API_BASE}/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: `${SYSTEM_PROMPT}\n\nUser Query: "${userQuery}"\n\nReturn structured JSON:`,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          topP: 0.8,
+          maxOutputTokens,
+          responseMimeType: "application/json",
+        },
+      }),
+    },
+  );
+
+  // Check if rate-limited (429) or quota exceeded
+  if (response.status === 429) {
+    console.warn("⚠️ Gemini rate-limited! Trying Groq as fallback...");
+    const result = await preprocessQueryWithGroq(userQuery);
+    cacheQuery(userQuery, result);
+    return JSON.stringify(result?.structuredQuery || {});
+  }
+
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    console.error("Gemini API Error:", errorData);
+    throw new Error(`Gemini API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (!data.candidates || !data.candidates[0]) {
+    throw new Error("No response from Gemini");
+  }
+
+  const content = data.candidates[0].content.parts[0].text;
+  console.log("Raw Gemini Response:", content);
+  return content;
+}
+
+function safeParseJson(content) {
+  if (!content) {
+    throw new Error("Empty Gemini response");
+  }
+
+  let jsonText = content.trim();
+  if (jsonText.startsWith("```json")) {
+    jsonText = jsonText.replace(/```json\n?/g, "").replace(/```\n?/g, "");
+  } else if (jsonText.startsWith("```")) {
+    jsonText = jsonText.replace(/```\n?/g, "");
+  }
+
+  const firstBrace = jsonText.indexOf("{");
+  const lastBrace = jsonText.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    jsonText = jsonText.slice(firstBrace, lastBrace + 1);
+  }
+
+  jsonText = jsonText.replace(/,\s*}/g, "}").replace(/,\s*]/g, "]");
+
+  return JSON.parse(jsonText);
 }
 
 /**
@@ -355,33 +498,69 @@ export async function preprocessQuery(userQuery, options = {}) {
 function createFallbackQuery(userQuery) {
   const lowerQuery = userQuery.toLowerCase();
   const query = {
-    intent: \"filter\",
+    intent: "filter",
     fields: [],
     conditions: [],
     confidence: 0.6,
     usedAI: false,
-    mode: \"fallback\",
+    mode: "fallback",
   };
 
+  // Extract limit from query
+  const wordNumberMap = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    twenty: 20,
+    thirty: 30,
+    forty: 40,
+    fifty: 50,
+  };
+  const limitMatch = lowerQuery.match(
+    /\btop\s+(\d+|[a-z]+)\b|\b(\d+|[a-z]+)\s+stocks?\b/,
+  );
+  if (limitMatch) {
+    const rawValue = limitMatch[1] || limitMatch[2];
+    const limit = /\d+/.test(rawValue)
+      ? parseInt(rawValue, 10)
+      : wordNumberMap[rawValue];
+    if (limit) query.limit = limit;
+  }
+
   // Simple keyword-based parsing
-  if (lowerQuery.includes(\"pe\") && !lowerQuery.includes(\"peg\")) {
-    query.fields.push(\"pe_ratio\");
-    const match = userQuery.match(/(less than|below|<)\\s*(\\d+)/i);
+  if (lowerQuery.includes("pe") && !lowerQuery.includes("peg")) {
+    query.fields.push("pe_ratio");
+    const match = userQuery.match(/(less than|below|<)\s*(\d+)/i);
     if (match) {
-      query.conditions.push({ field: \"pe_ratio\", operator: \"<\", value: parseFloat(match[2]) });
+      query.conditions.push({
+        field: "pe_ratio",
+        operator: "<",
+        value: parseFloat(match[2]),
+      });
     }
   }
 
-  if (lowerQuery.includes(\"dividend\")) {
-    query.fields.push(\"dividend_yield\");
-    const match = userQuery.match(/(above|greater|>)\\s*(\\d+)/i);
+  if (lowerQuery.includes("dividend")) {
+    query.fields.push("dividend_yield");
+    const match = userQuery.match(/(above|greater|>)\s*(\d+)/i);
     if (match) {
-      query.conditions.push({ field: \"dividend_yield\", operator: \">\", value: parseFloat(match[2]) });
+      query.conditions.push({
+        field: "dividend_yield",
+        operator: ">",
+        value: parseFloat(match[2]),
+      });
     }
   }
 
-  if (lowerQuery.includes(\"market cap\") || lowerQuery.includes(\"mcap\")) {
-    query.fields.push(\"market_cap\");
+  if (lowerQuery.includes("market cap") || lowerQuery.includes("mcap")) {
+    query.fields.push("market_cap");
   }
 
   return {
@@ -390,7 +569,7 @@ function createFallbackQuery(userQuery) {
     intent: query.intent,
     confidence: query.confidence,
     usedAI: false,
-    mode: \"fallback\",
+    mode: "fallback",
   };
 }
 
@@ -402,19 +581,24 @@ function createFallbackQuery(userQuery) {
  */
 function enhanceWithFallback(aiQuery, userQuery) {
   const fallback = createFallbackQuery(userQuery);
-  
+
   // Merge AI and fallback results
   return {
     error: null,
     structuredQuery: {
       ...aiQuery,
-      conditions: [...aiQuery.conditions, ...fallback.structuredQuery.conditions],
-      fields: [...new Set([...aiQuery.fields, ...fallback.structuredQuery.fields])],
+      conditions: [
+        ...aiQuery.conditions,
+        ...fallback.structuredQuery.conditions,
+      ],
+      fields: [
+        ...new Set([...aiQuery.fields, ...fallback.structuredQuery.fields]),
+      ],
     },
     intent: aiQuery.intent,
     confidence: (aiQuery.confidence + fallback.structuredQuery.confidence) / 2,
     usedAI: true,
-    mode: \"hybrid\",
+    mode: "hybrid",
     enhanced: true,
   };
 }

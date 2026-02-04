@@ -4,6 +4,7 @@
  */
 
 import cors from "cors";
+import "dotenv/config";
 import express from "express";
 import { fetchYahooNews } from "../middleware/information.js";
 import { processQueryForDisplay } from "../middleware/queryreplicat.js";
@@ -15,8 +16,15 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Add request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.path}`);
+  next();
+});
+
 // Health check endpoint
 app.get("/", (req, res) => {
+  console.log("Health check requested");
   res.json({
     status: "running",
     message: "Stock Query API Server",
@@ -123,7 +131,7 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 Stock Query API Server running on port ${PORT}`);
   console.log(`📍 URL: http://localhost:${PORT}`);
   console.log(`📍 Android Emulator: http://10.0.2.2:${PORT}`);
@@ -132,6 +140,25 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`   POST /api/query      - Process single query`);
   console.log(`   POST /api/query/batch - Process multiple queries`);
   console.log(`\n✅ Ready to accept requests!\n`);
+});
+
+// Handle server errors
+server.on("error", (err) => {
+  console.error("❌ Server error:", err.message);
+  if (err.code === "EADDRINUSE") {
+    console.error(`Port ${PORT} is already in use`);
+    process.exit(1);
+  }
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (err) => {
+  console.error("❌ Uncaught Exception:", err);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ Unhandled Rejection at:", promise, "reason:", reason);
 });
 
 export default app;

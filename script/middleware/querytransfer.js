@@ -152,6 +152,178 @@ function cleanUserQuery(query) {
 }
 
 /**
+ * Infer a result limit from query text
+ * @param {string} query - Cleaned query text
+ * @returns {number|null} Limit
+ */
+function inferLimitFromQuery(query) {
+  const normalized = query.toLowerCase();
+  const wordNumberMap = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+    thirteen: 13,
+    fourteen: 14,
+    fifteen: 15,
+    sixteen: 16,
+    seventeen: 17,
+    eighteen: 18,
+    nineteen: 19,
+    twenty: 20,
+    thirty: 30,
+    forty: 40,
+    fifty: 50,
+    sixty: 60,
+    seventy: 70,
+    eighty: 80,
+    ninety: 90,
+    hundred: 100,
+  };
+
+  const match = normalized.match(
+    /\btop\s+(\d+|[a-z]+)\b|\b(\d+|[a-z]+)\s+stocks?\b/,
+  );
+  if (!match) {
+    return null;
+  }
+
+  const rawValue = match[1] || match[2];
+  const value = /\d+/.test(rawValue)
+    ? parseInt(rawValue, 10)
+    : wordNumberMap[rawValue];
+
+  return Number.isNaN(value) || !value ? null : value;
+}
+
+function applyRuleBasedOverrides(query, structuredQuery) {
+  const normalized = query.toLowerCase();
+  const updated = {
+    ...structuredQuery,
+    fields: Array.isArray(structuredQuery.fields)
+      ? [...structuredQuery.fields]
+      : [],
+    conditions: Array.isArray(structuredQuery.conditions)
+      ? [...structuredQuery.conditions]
+      : [],
+  };
+
+  const limit = inferLimitFromQuery(normalized);
+  if (limit) {
+    updated.limit = limit;
+  }
+
+  if (normalized.includes("nifty 500")) {
+    updated.dataSource = "nifty500";
+  } else if (normalized.includes("nifty 100")) {
+    updated.dataSource = "nifty100";
+  } else if (normalized.includes("nifty 50")) {
+    updated.dataSource = "nifty50";
+  }
+
+  if (normalized.includes("top gainer") || normalized.includes("gainers")) {
+    updated.intent = "gainers";
+    updated.orderBy = "percent_change";
+    updated.orderDirection = "desc";
+    updated.conditions.push({
+      field: "percent_change",
+      operator: ">",
+      value: 0,
+    });
+  }
+
+  if (normalized.includes("loser") || normalized.includes("fell the most")) {
+    updated.intent = "losers";
+    updated.orderBy = "percent_change";
+    updated.orderDirection = "asc";
+    updated.conditions.push({
+      field: "percent_change",
+      operator: "<",
+      value: 0,
+    });
+  }
+
+  if (normalized.includes("most active") || normalized.includes("by volume")) {
+    updated.intent = "most_active";
+    updated.orderBy = "volume";
+    updated.orderDirection = "desc";
+  }
+
+  if (normalized.includes("market sentiment")) {
+    updated.intent = "sentiment";
+    updated.orderBy = "percent_change";
+    updated.orderDirection = "desc";
+  }
+
+  if (
+    normalized.includes("52-week high") ||
+    normalized.includes("52 week high")
+  ) {
+    updated.intent = "week_high";
+    updated.conditions.push({
+      field: "near_week_high",
+      operator: "BETWEEN",
+      value: [-1, 1],
+    });
+  }
+
+  if (
+    normalized.includes("52-week low") ||
+    normalized.includes("52 week low")
+  ) {
+    updated.intent = "week_low";
+    updated.conditions.push({
+      field: "near_week_low",
+      operator: "BETWEEN",
+      value: [-1, 1],
+    });
+  }
+
+  if (
+    normalized.includes("near 52-week low") ||
+    normalized.includes("near 52 week low")
+  ) {
+    updated.intent = "near_week_low";
+    updated.conditions.push({
+      field: "near_week_low",
+      operator: "BETWEEN",
+      value: [-5, 5],
+    });
+  }
+
+  if (
+    normalized.includes("unusual trading") ||
+    normalized.includes("unusual activity")
+  ) {
+    updated.intent = "unusual_activity";
+    updated.orderBy = "volume";
+    updated.orderDirection = "desc";
+    if (!updated.limit) {
+      updated.limit = 20;
+    }
+  }
+
+  if (normalized.includes("midcap")) {
+    updated.intent = "midcap";
+    updated.conditions.push({
+      field: "market_cap",
+      operator: "BETWEEN",
+      value: [1e11, 5e11],
+    });
+  }
+
+  return { structuredQuery: updated };
+}
+
+/**
  * Validate basic query structure
  * @param {string} query - User query
  * @returns {Object} Validation result
@@ -247,6 +419,26 @@ export async function transferQuery(userQuery, options = {}) {
         stage: "preprocessing",
         rawQuery: userQuery,
       };
+    }
+
+    const inferredLimit = inferLimitFromQuery(cleanedQuery);
+    if (
+      inferredLimit &&
+      (!preprocessed.structuredQuery.limit ||
+        preprocessed.structuredQuery.limit < inferredLimit)
+    ) {
+      console.log(`📊 Applying inferred limit: ${inferredLimit}`);
+      preprocessed.structuredQuery.limit = inferredLimit;
+    }
+
+    const ruleBased = applyRuleBasedOverrides(
+      cleanedQuery,
+      preprocessed.structuredQuery,
+    );
+    if (ruleBased) {
+      preprocessed.structuredQuery = ruleBased.structuredQuery;
+      preprocessed.intent =
+        ruleBased.structuredQuery.intent || preprocessed.intent;
     }
 
     // Step 2: Validate fields
