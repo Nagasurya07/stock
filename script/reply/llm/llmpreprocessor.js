@@ -13,7 +13,9 @@ const API_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.EXPO_PUBLIC_GROQ_MODEL || "mixtral-8x7b-32768";
 const GROQ_API_BASE = "https://api.groq.com/openai/v1";
-/**
+// AI Configuration: Use AI in 90% of scenarios, fallback in 10%
+const USE_AI_PERCENTAGE = 0.9;
+const AI_CONFIDENCE_THRESHOLD = 0.75;/**
  * Preprocess query using Groq API (fallback when Gemini rate-limited)
  * @param {string} userQuery - User's natural language query
  * @returns {Promise<Object>} Structured query or error
@@ -240,12 +242,20 @@ Return ONLY valid JSON. No markdown, no explanation.`;
  * @returns {Promise<Object>} Preprocessed structured query
  */
 export async function preprocessQuery(userQuery, options = {}) {
+  // Force AI usage based on configuration (90% of time)
+  const shouldUseAI = Math.random() < USE_AI_PERCENTAGE;
+  
+  if (!shouldUseAI) {
+    console.log(\"📊 Using fallback mode (10% scenario)\");
+    return createFallbackQuery(userQuery);
+  }
+
   if (!GEMINI_API_KEY) {
-    console.warn("⚠️ Gemini API key missing. Using Groq fallback...");
+    console.warn(\"⚠️ Gemini API key missing. Using Groq fallback...\");
     return preprocessQueryWithGroq(userQuery);
   }
 
-  console.log("🤖 Preprocessing query with Gemini...");
+  console.log(\"🤖 Preprocessing query with AI (90% scenario)...\");
   console.log("Input:", userQuery);
 
   try {
@@ -314,18 +324,99 @@ export async function preprocessQuery(userQuery, options = {}) {
       JSON.stringify(structuredQuery, null, 2),
     );
 
+    // Validate confidence level
+    const confidence = structuredQuery.confidence || 0.8;
+    if (confidence < AI_CONFIDENCE_THRESHOLD) {
+      console.warn(`⚠️ Low AI confidence (${confidence}), enhancing with fallback logic...`);
+      return enhanceWithFallback(structuredQuery, userQuery);
+    }
+
     return {
       error: null,
       structuredQuery: structuredQuery,
       intent: structuredQuery.intent,
-      confidence: structuredQuery.confidence || 0.8,
+      confidence: confidence,
       rawResponse: content,
+      usedAI: true,
+      mode: \"gemini\",
     };
   } catch (error) {
-    console.error("❌ Preprocessing Error:", error.message);
-    console.warn("⚠️ Gemini failed! Attempting Groq fallback...");
+    console.error(\"❌ Preprocessing Error:\", error.message);
+    console.warn(\"⚠️ Gemini failed! Attempting Groq fallback...\");
     return preprocessQueryWithGroq(userQuery);
   }
+}
+
+/**
+ * Create a simple fallback query for 10% scenarios
+ * @param {string} userQuery - Natural language query
+ * @returns {Object} Basic structured query
+ */
+function createFallbackQuery(userQuery) {
+  const lowerQuery = userQuery.toLowerCase();
+  const query = {
+    intent: \"filter\",
+    fields: [],
+    conditions: [],
+    confidence: 0.6,
+    usedAI: false,
+    mode: \"fallback\",
+  };
+
+  // Simple keyword-based parsing
+  if (lowerQuery.includes(\"pe\") && !lowerQuery.includes(\"peg\")) {
+    query.fields.push(\"pe_ratio\");
+    const match = userQuery.match(/(less than|below|<)\\s*(\\d+)/i);
+    if (match) {
+      query.conditions.push({ field: \"pe_ratio\", operator: \"<\", value: parseFloat(match[2]) });
+    }
+  }
+
+  if (lowerQuery.includes(\"dividend\")) {
+    query.fields.push(\"dividend_yield\");
+    const match = userQuery.match(/(above|greater|>)\\s*(\\d+)/i);
+    if (match) {
+      query.conditions.push({ field: \"dividend_yield\", operator: \">\", value: parseFloat(match[2]) });
+    }
+  }
+
+  if (lowerQuery.includes(\"market cap\") || lowerQuery.includes(\"mcap\")) {
+    query.fields.push(\"market_cap\");
+  }
+
+  return {
+    error: null,
+    structuredQuery: query,
+    intent: query.intent,
+    confidence: query.confidence,
+    usedAI: false,
+    mode: \"fallback\",
+  };
+}
+
+/**
+ * Enhance low-confidence AI results with fallback logic
+ * @param {Object} aiQuery - AI-generated query
+ * @param {string} userQuery - Original user query
+ * @returns {Object} Enhanced query
+ */
+function enhanceWithFallback(aiQuery, userQuery) {
+  const fallback = createFallbackQuery(userQuery);
+  
+  // Merge AI and fallback results
+  return {
+    error: null,
+    structuredQuery: {
+      ...aiQuery,
+      conditions: [...aiQuery.conditions, ...fallback.structuredQuery.conditions],
+      fields: [...new Set([...aiQuery.fields, ...fallback.structuredQuery.fields])],
+    },
+    intent: aiQuery.intent,
+    confidence: (aiQuery.confidence + fallback.structuredQuery.confidence) / 2,
+    usedAI: true,
+    mode: \"hybrid\",
+    enhanced: true,
+  };
 }
 
 /**

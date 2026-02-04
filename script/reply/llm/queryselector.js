@@ -11,6 +11,16 @@ const RAPIDAPI_HOST =
   "indian-stock-market.p.rapidapi.com";
 const API_BASE = `https://${RAPIDAPI_HOST}`;
 
+// AI Configuration for intelligent matching
+const GEMINI_API_KEY =
+  process.env.EXPO_PUBLIC_GEMINI_API_KEY ||
+  "AIzaSyC5ppCM0i7f2LWIN_4Ne2RnDNuE5k8lkKg";
+const GEMINI_MODEL = process.env.EXPO_PUBLIC_GEMINI_MODEL || "gemini-2.5-flash";
+const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY || "";
+const GROQ_MODEL = process.env.EXPO_PUBLIC_GROQ_MODEL || "mixtral-8x7b-32768";
+const AI_CONFIDENCE_THRESHOLD = 0.7; // Use AI if confidence > 70%
+const USE_AI_PERCENTAGE = 0.9; // Use AI in 90% of scenarios
+
 /**
  * Fetch stock data based on validated query
  * @param {Object} validatedQuery - Query from validator with fields, conditions, orderBy, limit
@@ -41,23 +51,36 @@ export async function selectStockData(validatedQuery) {
 
     console.log(`Fetched ${rawData.length} stocks from API`);
 
-    // Step 3: Filter data based on conditions
-    console.log("\n🔎 Applying filters...");
-    const filtered = filterStockData(rawData, validatedQuery.conditions);
+    // Step 3: Filter data based on conditions with AI (90% scenarios)
+    console.log("\n🔎 Applying AI-powered filters...");
+    const filtered = await filterStockData(
+      rawData,
+      validatedQuery.conditions,
+      true,
+    );
     console.log(`${filtered.length} stocks match conditions`);
 
-    // Step 4: Sort data
-    if (validatedQuery.orderBy) {
+    // Step 4: AI-powered result evaluation and ranking
+    console.log("\n🤖 Evaluating results with AI...");
+    const evaluated = await evaluateResultsWithAI(
+      filtered,
+      validatedQuery,
+      validatedQuery.limit || 50,
+    );
+
+    // Step 5: Sort data (fallback if AI evaluation didn't rank)
+    let finalResults = evaluated.rankedResults || filtered;
+    if (!evaluated.rankedResults && validatedQuery.orderBy) {
       console.log("\n📈 Sorting by:", validatedQuery.orderBy);
-      filtered.sort((a, b) => {
+      finalResults.sort((a, b) => {
         const aVal = getFieldValue(a, validatedQuery.orderBy) || 0;
         const bVal = getFieldValue(b, validatedQuery.orderBy) || 0;
         return bVal - aVal; // Descending order
       });
     }
 
-    // Step 5: Limit results
-    const limited = filtered.slice(0, validatedQuery.limit || 50);
+    // Step 6: Limit results
+    const limited = finalResults.slice(0, validatedQuery.limit || 50);
 
     const result = {
       success: true,
@@ -68,6 +91,9 @@ export async function selectStockData(validatedQuery) {
         returned: limited.length,
         dataSource: dataSource,
         processingTime: Date.now() - startTime,
+        aiPowered: evaluated.usedAI || false,
+        aiConfidence: evaluated.confidence || 0,
+        aiReasoning: evaluated.reasoning || null,
       },
     };
 
@@ -155,28 +181,166 @@ async function fetchStockData(source) {
 }
 
 /**
- * Filter stock data based on conditions
+ * Filter stock data based on conditions with AI-powered matching
  * @param {Array} stocks - Array of stock objects
  * @param {Array} conditions - Filter conditions
- * @returns {Array} Filtered stocks
+ * @param {boolean} useAI - Whether to use AI (default true for 90% scenarios)
+ * @returns {Promise<Array>} Filtered stocks
  */
-function filterStockData(stocks, conditions) {
+async function filterStockData(stocks, conditions, useAI = true) {
   if (!conditions || conditions.length === 0) {
     return stocks;
   }
 
-  return stocks.filter((stock) => {
-    // All conditions must be true (AND logic)
-    return conditions.every((condition) => {
-      const fieldValue = getFieldValue(stock, condition.field);
+  const filteredStocks = [];
+
+  for (const stock of stocks) {
+    // Check all conditions (AND logic)
+    let matchesAll = true;
+
+    for (const condition of conditions) {
+      const fieldValue = useAI
+        ? await getFieldValueWithAI(stock, condition.field, true)
+        : getFieldValue(stock, condition.field);
 
       if (fieldValue === null || fieldValue === undefined) {
-        return false;
+        matchesAll = false;
+        break;
       }
 
-      return evaluateCondition(fieldValue, condition.operator, condition.value);
-    });
-  });
+      if (!evaluateCondition(fieldValue, condition.operator, condition.value)) {
+        matchesAll = false;
+        break;
+      }
+    }
+
+    if (matchesAll) {
+      filteredStocks.push(stock);
+    }
+  }
+
+  return filteredStocks;
+}
+
+/**
+ * AI-powered field mapping - Uses LLM to intelligently match query fields to API fields
+ * @param {Object} stock - Stock object with API field names
+ * @param {string} queryField - Field name from user query
+ * @param {boolean} useAI - Whether to use AI (90% of time)
+ * @returns {Promise<any>} Field value or null
+ */
+async function getFieldValueWithAI(stock, queryField, useAI = true) {
+  // Decide whether to use AI or fallback (90% AI, 10% fallback)
+  const shouldUseAI = useAI && Math.random() < USE_AI_PERCENTAGE;
+
+  if (shouldUseAI && (GEMINI_API_KEY || GROQ_API_KEY)) {
+    try {
+      const mapping = await aiFieldMapping(stock, queryField);
+      if (mapping && mapping.confidence > AI_CONFIDENCE_THRESHOLD) {
+        return mapping.value;
+      }
+    } catch (error) {
+      console.warn(`AI field mapping failed for ${queryField}, using fallback`);
+    }
+  }
+
+  // Fallback to traditional mapping
+  return getFieldValue(stock, queryField);
+}
+
+/**
+ * Use AI to intelligently map query field to actual API field
+ * @param {Object} stock - Stock data object
+ * @param {string} queryField - Field name from query
+ * @returns {Promise<Object>} Mapping result with value and confidence
+ */
+async function aiFieldMapping(stock, queryField) {
+  const availableFields = Object.keys(stock);
+  const prompt = `Given a stock data object with these fields: ${availableFields.join(", ")}
+
+Find the best matching field for the query field: "${queryField}"
+
+Return JSON:
+{
+  "matchedField": "exact_field_name",
+  "confidence": 0.0-1.0,
+  "reasoning": "why this field matches"
+}`;
+
+  try {
+    // Try Gemini first
+    if (GEMINI_API_KEY) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 256 },
+          }),
+        },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (content) {
+          const result = JSON.parse(
+            content.replace(/```json\n?|```/g, "").trim(),
+          );
+          if (result.matchedField && stock[result.matchedField] !== undefined) {
+            return {
+              value: parseNumericValue(stock[result.matchedField]),
+              confidence: result.confidence,
+              field: result.matchedField,
+            };
+          }
+        }
+      }
+    }
+
+    // Fallback to Groq
+    if (GROQ_API_KEY) {
+      const response = await fetch(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.1,
+            max_tokens: 256,
+          }),
+        },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content;
+        if (content) {
+          const result = JSON.parse(
+            content.replace(/```json\n?|```/g, "").trim(),
+          );
+          if (result.matchedField && stock[result.matchedField] !== undefined) {
+            return {
+              value: parseNumericValue(stock[result.matchedField]),
+              confidence: result.confidence,
+              field: result.matchedField,
+            };
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.warn(`AI field mapping error: ${error.message}`);
+  }
+
+  return null;
 }
 
 /**
@@ -331,6 +495,141 @@ export async function selectBatch(validatedQueries) {
   }
 
   return results;
+}
+
+/**
+ * AI-powered result evaluation and ranking
+ * Uses AI to evaluate and rank results based on query intent and accuracy
+ * @param {Array} stocks - Filtered stock results
+ * @param {Object} query - Original validated query
+ * @param {number} limit - Maximum results to return
+ * @returns {Promise<Object>} Evaluated and ranked results
+ */
+async function evaluateResultsWithAI(stocks, query, limit) {
+  // Use AI in 90% of scenarios
+  const shouldUseAI = Math.random() < USE_AI_PERCENTAGE;
+
+  if (
+    !shouldUseAI ||
+    (!GEMINI_API_KEY && !GROQ_API_KEY) ||
+    stocks.length === 0
+  ) {
+    return { rankedResults: null, usedAI: false };
+  }
+
+  try {
+    // Prepare stock summaries for AI evaluation
+    const stockSummaries = stocks.slice(0, 100).map((stock, idx) => ({
+      index: idx,
+      symbol: stock.symbol || stock.ticker || `Stock-${idx}`,
+      name: stock.company_name || stock.name || "Unknown",
+      // Include relevant fields from conditions
+      fields: query.conditions.reduce((acc, cond) => {
+        const value = getFieldValue(stock, cond.field);
+        if (value !== null) acc[cond.field] = value;
+        return acc;
+      }, {}),
+    }));
+
+    const prompt = `You are a stock analysis expert. Evaluate and rank these stocks based on the query intent.
+
+Query Intent: ${query.intent}
+Conditions: ${JSON.stringify(query.conditions)}
+Order By: ${query.orderBy || "relevance"}
+
+Stocks (showing first ${Math.min(stocks.length, 100)}):
+${JSON.stringify(stockSummaries, null, 2)}
+
+Rank the stocks by relevance and accuracy to the query. Return JSON:
+{
+  "rankedIndices": [index1, index2, ...],
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}
+
+Return only the top ${limit} most relevant stocks.`;
+
+    let result = null;
+
+    // Try Gemini first
+    if (GEMINI_API_KEY) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { temperature: 0.2, maxOutputTokens: 1024 },
+            }),
+          },
+        );
+
+        if (response.ok) {
+          const data = await response.json();
+          const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (content) {
+            result = JSON.parse(content.replace(/```json\n?|```/g, "").trim());
+          }
+        }
+      } catch (error) {
+        console.warn("Gemini evaluation failed, trying Groq...");
+      }
+    }
+
+    // Fallback to Groq
+    if (!result && GROQ_API_KEY) {
+      const response = await fetch(
+        "https://api.groq.com/openai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.2,
+            max_tokens: 1024,
+          }),
+        },
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content;
+        if (content) {
+          result = JSON.parse(content.replace(/```json\n?|```/g, "").trim());
+        }
+      }
+    }
+
+    if (
+      result &&
+      result.rankedIndices &&
+      result.confidence > AI_CONFIDENCE_THRESHOLD
+    ) {
+      console.log(
+        `✅ AI ranked ${result.rankedIndices.length} results (confidence: ${result.confidence})`,
+      );
+      const rankedResults = result.rankedIndices
+        .filter((idx) => idx < stocks.length)
+        .map((idx) => stocks[idx]);
+
+      return {
+        rankedResults,
+        usedAI: true,
+        confidence: result.confidence,
+        reasoning: result.reasoning,
+      };
+    }
+  } catch (error) {
+    console.warn(`AI evaluation error: ${error.message}`);
+  }
+
+  return { rankedResults: null, usedAI: false };
 }
 
 /**
